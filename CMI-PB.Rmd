@@ -1,0 +1,999 @@
+---
+title: "CMI-PB"
+output: html_document
+date: "2024-09-29"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### demonstration of model construction
+
+```{r}
+library(Seurat)
+library(lubridate)
+library(tidyverse)
+library(DT)
+library(BiocStyle)
+library(biomaRt)
+library(dplyr)
+library(h2o)
+
+
+submission_template = readr::read_tsv("3rdChallengeSubmissionTemplate.tsv")
+master_harmonized_data = read_rds("master_harmonized_data.RDS")
+
+subject_specimen_2023BD = master_harmonized_data$challenge$subject_specimen
+plasma_ab_titer_2023BD = master_harmonized_data$challenge$plasma_antibody_levels$long
+
+kept_columns <- submission_template %>%
+  dplyr::select(SubjectID, Age, BiologicalSexAtBirth, VaccinePrimingStatus)
+
+# Getting the names of columns to be replaced with age_rank
+submission_template_col_names <- names(submission_template)
+```
+
+```{r}
+IgG_baseline_model_df <- plasma_ab_titer_2023BD %>%
+  dplyr::left_join(subject_specimen_2023BD) %>%
+  filter(isotype_antigen == "IgG_PT")  %>%
+  filter(planned_day_relative_to_boost == 0)  %>%
+  dplyr::select(subject_id, MFI_normalised)  %>%
+  mutate(IgG_baseline_rank = rank(MFI_normalised)) %>%
+  dplyr::select(subject_id, IgG_baseline_rank) %>%
+  rename("SubjectID" = "subject_id") 
+
+IgG_baseline_final_model_df <- IgG_baseline_model_df %>%
+  mutate(
+    "task1_1" = IgG_baseline_rank,
+    "task1_2" = IgG_baseline_rank
+  ) %>%
+  dplyr::select(-IgG_baseline_rank)
+
+### prepare submission files 
+kept_columns_v2 <- submission_template %>%
+  dplyr::select(SubjectID, "2.1) Monocytes-D1-Rank","2.2) Monocytes-D1-FC-Rank","3.1) CCL3-D3-Rank",                  
+  "3.2) CCL3-D3-FC-Rank","4.1) IFNG/IL5-Polarization-D30-Rank")
+
+# Creating a dataframe with age_rank repeated for each column to be replaced
+IgG_model_submission_df <- kept_columns %>%
+  left_join(IgG_baseline_final_model_df, by = "SubjectID") %>%
+  left_join(kept_columns_v2, by = "SubjectID")
+
+# Combining the kept columns with the new age_rank columns
+colnames(IgG_model_submission_df) <- submission_template_col_names
+
+# View the updated submission template
+datatable(IgG_model_submission_df)
+```
+
+### GLM model construction
+
+
+```{r}
+### generate training data (x,y) 
+subject_specimen_training = master_harmonized_data$training$subject_specimen
+plasma_ab_titer_training = master_harmonized_data$training$plasma_antibody_levels$wide
+gene_expression_training = master_harmonized_data$training$pbmc_gene_expression$wide_tpm
+cell_type_training = master_harmonized_data$training$pbmc_cell_frequency$wide
+plasma_cytokine_training = master_harmonized_data$training$plasma_cytokine_concentrations_by_olink$wide
+t_cell_polarization_training = master_harmonized_data$training$t_cell_polarization$wide
+t_cell_activation_training = master_harmonized_data$training$t_cell_activation$wide
+
+### generate challenge data
+subject_specimen_challenge = master_harmonized_data$challenge$subject_specimen
+plasma_ab_titer_challenge = master_harmonized_data$challenge$plasma_antibody_levels$wide
+gene_expression_challenge = master_harmonized_data$challenge$pbmc_gene_expression$wide_tpm
+cell_type_challenge = master_harmonized_data$challenge$pbmc_cell_frequency$wide
+plasma_cytokine_challenge = master_harmonized_data$challenge$plasma_cytokine_concentrations_by_olink$wide
+t_cell_polarization_challenge = master_harmonized_data$challenge$t_cell_polarization$wide
+t_cell_activation_challenge = master_harmonized_data$challenge$t_cell_activation$wide
+
+IgG_model_challenge <- plasma_ab_titer_challenge %>%
+  left_join(subject_specimen_challenge) %>%
+  dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3","specimen_id","subject_id","planned_day_relative_to_boost","biological_sex","year_of_birth","date_of_boost","dataset") %>% 
+  mutate(age = interval(ymd(year_of_birth), ymd(date_of_boost)) / years(1)) %>%
+  dplyr::select (-date_of_boost,-year_of_birth)
+
+day0 <- IgG_model_challenge %>% filter(planned_day_relative_to_boost == 0) %>% dplyr::select(specimen_id)
+IgG_model_challenge <- IgG_model_challenge %>% filter(planned_day_relative_to_boost == 0)
+
+gene_expression_challenge <- gene_expression_challenge %>% right_join(day0)
+cell_type_challenge <- cell_type_challenge %>% right_join(day0)
+plasma_cytokine_challenge <- plasma_cytokine_challenge %>% right_join(day0)
+t_cell_polarization_challenge <- t_cell_polarization_challenge %>% right_join(day0)
+t_cell_activation_challenge <- t_cell_activation_challenge %>% right_join(day0)
+
+# gene_expression_challenge <- gene_expression_challenge %>% filter(specimen_id %in% IgG_model_challenge$specimen_id)
+# cell_type_challenge <- cell_type_challenge %>% filter(specimen_id %in% IgG_model_challenge$specimen_id)
+# plasma_cytokine_challenge <- plasma_cytokine_challenge %>% filter(specimen_id %in% IgG_model_challenge$specimen_id)
+# t_cell_polarization_challenge <- t_cell_polarization_challenge %>% filter(specimen_id %in% IgG_model_challenge$specimen_id)
+# t_cell_activation_challenge <- t_cell_activation_challenge %>% filter(specimen_id %in% IgG_model_challenge$specimen_id)
+
+gene_expression_challenge <- gene_expression_challenge %>% 
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+cell_type_challenge <- cell_type_challenge %>% 
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+plasma_cytokine_challenge <- plasma_cytokine_challenge %>% 
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+t_cell_polarization_challenge <- t_cell_polarization_challenge %>% 
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+t_cell_activation_challenge <- t_cell_activation_challenge %>% 
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+```
+
+## task 1
+```{r}
+IgG__model_df <- plasma_ab_titer_training %>%
+  left_join(subject_specimen_training) %>%
+  dplyr::select("IgG_PT","IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3","specimen_id","subject_id","planned_day_relative_to_boost","biological_sex","year_of_birth","date_of_boost","dataset") %>% 
+  mutate(age = interval(ymd(year_of_birth), ymd(date_of_boost)) / years(1)) %>%
+  dplyr::select (-date_of_boost,-year_of_birth)
+  
+day0_training <- IgG__model_df %>% filter(planned_day_relative_to_boost == 0) %>% arrange(subject_id)
+day14_testing <- IgG__model_df %>% filter(planned_day_relative_to_boost == 14) %>% arrange(subject_id) %>% dplyr::select("subject_id","IgG_PT")
+
+### remove samples that do not have day 14 
+day0_training <- day0_training[-which(!day0_training$subject_id %in% day14_testing$subject_id),]
+day14_testing$IgG_PT_FC <- day14_testing$IgG_PT/day0_training$IgG_PT
+
+### add other features
+# gene_expression <- gene_expression_training %>% inner_join(day0_training, by = "specimen_id") %>% arrange(specimen_id)
+# cell_type <- cell_type_training %>% inner_join(day0_training, by = "specimen_id") %>% arrange(specimen_id)
+# plasma_cytokine <- plasma_cytokine_training %>% inner_join(day0_training, by = "specimen_id") %>% arrange(specimen_id) 
+# t_cell_polarization <- t_cell_polarization_training  %>% inner_join(day0_training, by = "specimen_id") %>% arrange(specimen_id) 
+# t_cell_activation <- t_cell_activation_training %>% inner_join(day0_training, by = "specimen_id") %>% arrange(specimen_id) 
+
+gene_expression <- gene_expression_training
+common_specimen_ids <- Reduce(intersect, list(gene_expression$specimen_id, day0_training$specimen_id))
+gene_expression <- gene_expression[gene_expression$specimen_id %in% common_specimen_ids, ] %>% arrange(specimen_id)
+idx <- which(day0_training$specimen_id %in% common_specimen_ids)
+
+day0_training <- day0_training[idx,]
+day14_testing <- day14_testing[idx,]
+
+### add the challenge data
+gene_expression <- rbind(gene_expression,gene_expression_challenge)
+
+### change gene expression to symbol name and select top 2000 hvf genes
+expr_matrix <- gene_expression[,-1]
+expr_matrix <- apply(expr_matrix, 2, as.numeric)
+expr_matrix <- t(expr_matrix)
+
+expr_matrix <- expr_matrix[rowSums(expr_matrix) > 0, ]
+expr_matrix <- expr_matrix[!apply(expr_matrix, 1, function(row) all(is.na(row))), ]
+
+seurat_object <- CreateSeuratObject(counts = expr_matrix)
+seurat_object <- FindVariableFeatures(seurat_object, selection.method = "vst", nfeatures = 2000)
+top_variable_genes <- VariableFeatures(seurat_object)
+
+gene_expression_top <- gene_expression[,which(colnames(gene_expression) %in% top_variable_genes)]
+
+mart <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+ensembl_ids <- gsub("\\..*", "", colnames(gene_expression_top))
+gene_info <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+filters = "ensembl_gene_id",
+  values = ensembl_ids,
+  mart = mart
+)
+gene_info <- gene_info[!gene_info$hgnc_symbol=="", ]
+idx <- which(ensembl_ids %in% gene_info$ensembl_gene_id)
+gene_expression_top <- gene_expression_top[,idx]
+colnames(gene_expression_top) <- gene_info$hgnc_symbol
+
+pca_result <- prcomp(gene_expression_top, center = TRUE, scale. = TRUE)
+
+### Train model for task 1.1
+model_data <- as.data.frame(cbind(day14_testing[,"IgG_PT"],day0_training %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3","age","biological_sex"),pca_result$x[,1:50]))
+
+model_data$biological_sex <- as.factor(model_data$biological_sex)
+model_data$IgG_PT <- round(model_data$IgG_PT)
+spearman_correlation_task11 <- c()
+model_list_11 <- c()
+h2o.init()
+for (i in 1:30){
+  #set.seed(i)
+  # train_indices <- sample(seq_len(nrow(model_data)), size = 0.7 * nrow(model_data))
+  # train_data <- model_data[train_indices, ]
+  # test_data <- model_data[-train_indices, ]
+  # model <- glm(IgG_PT ~ ., 
+  #             family = poisson(link = "log"), 
+  #             data = train_data)
+  # predictions <- predict(model, test_data, type = "response")
+  data <- as.h2o(model_data)
+  splits <- h2o.splitFrame(data, ratios = 0.7, seed = i)
+  train_data <- splits[[1]]
+  test_data <- splits[[2]]
+  y = "IgG_PT"
+  x = setdiff(names(train_data), y)
+  aml <- h2o.automl(x = x, y = y,
+                  training_frame = train_data,
+                  max_runtime_secs = 60,
+                  seed = i)
+  lb <- aml@leaderboard
+  predictions <- h2o.predict(aml@leader, test_data)
+  model_list_11 <- c(model_list_11,aml@leader@model_id)
+  spearman_estimate <- cor.test(as.vector(predictions[,1]),as.vector(test_data[,"IgG_PT"]),method = "spearman",exact = FALSE)$estimate
+  spearman_correlation_task11 <- c(spearman_correlation_task11,spearman_estimate)
+}
+spearman_correlation_task11 <- sort(spearman_correlation_task11, decreasing = TRUE)[1:10]
+h2o.shutdown()
+
+### make predictions for the challenge dataset
+h2o.init()
+model_data <- as.data.frame(cbind(day14_testing[,"IgG_PT"],day0_training %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3","age","biological_sex"),pca_result$x[1:nrow(day0_training),1:50]))
+
+model_data$biological_sex <- as.factor(model_data$biological_sex)
+model_data$IgG_PT <- round(model_data$IgG_PT)
+
+data <- as.h2o(model_data)
+y = "IgG_PT"
+x = setdiff(names(data), y)
+aml <- h2o.automl(x = x, y = y,
+                  training_frame = data,
+                  max_runtime_secs = 60,
+                  seed = 1234)
+
+challenge_data <- as.data.frame(cbind(IgG_model_challenge %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3","age","biological_sex"),pca_result$x[(nrow(day0_training)+1):nrow(pca_result$x),1:50]))
+challenge_data <- as.h2o(challenge_data)
+
+print(aml@leader)
+challenge_predictions_11 <- h2o.predict(aml@leader, challenge_data)
+challenge_predictions_11 <- rank(as.vector(challenge_predictions_11[,1]))
+h2o.shutdown()
+
+### Train model for task 1.2 
+
+model_data <- as.data.frame(cbind(day14_testing[,"IgG_PT_FC"],day0_training %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3","age","biological_sex"),pca_result$x[,1:3]))
+
+model_data$biological_sex <- as.factor(model_data$biological_sex)
+model_data$IgG_PT_FC <- round(model_data$IgG_PT_FC)
+#model_data$IgG_PT_FC <- 1 / (1 + exp(-model_data$IgG_PT_FC))
+
+spearman_correlation_task12 <- c()
+model_list_12 <- c()
+
+h2o.init()
+for (i in 1:30){
+  # set.seed(i)
+  # train_indices <- sample(seq_len(nrow(model_data)), size = 0.7 * nrow(model_data))
+  # train_data <- model_data[train_indices, ]
+  # test_data <- model_data[-train_indices, ]
+  # 
+  # model <- glm(IgG_PT_FC ~ ., 
+  #             family = poisson(link = "log"), 
+  #             data = train_data)
+  # predictions <- predict(model, test_data, type = "response")
+  
+  data <- as.h2o(model_data)
+  splits <- h2o.splitFrame(data, ratios = 0.7, seed = i)
+  train_data <- splits[[1]]
+  test_data <- splits[[2]]
+  y = "IgG_PT_FC"
+  x = setdiff(names(train_data), y)
+  aml <- h2o.automl(x = x, y = y,
+                  training_frame = train_data,
+                  max_runtime_secs = 60,
+                  seed = i)
+  lb <- aml@leaderboard
+  predictions <- h2o.predict(aml@leader, test_data)
+  model_list_12 <- c(model_list_12,aml@leader@model_id)
+  spearman_estimate <- cor.test(as.vector(predictions[,1]),as.vector(test_data[,"IgG_PT_FC"]),method = "spearman",exact = FALSE)$estimate
+  #spearman_estimate <- cor.test(predictions,test_data$IgG_PT_FC,method = "spearman",exact = FALSE)$estimate
+  spearman_correlation_task12 <- c(spearman_correlation_task12,spearman_estimate)
+}
+spearman_correlation_task12 <- sort(spearman_correlation_task12, decreasing = TRUE)[1:10]
+h2o.shutdown()
+
+### make predictions for the challenge dataset
+h2o.init()
+model_data <- as.data.frame(cbind(day14_testing[,"IgG_PT_FC"],day0_training %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3","age","biological_sex"),pca_result$x[1:nrow(day0_training),1:50]))
+
+model_data$biological_sex <- as.factor(model_data$biological_sex)
+model_data$IgG_PT_FC <- round(model_data$IgG_PT_FC)
+
+data <- as.h2o(model_data)
+y = "IgG_PT_FC"
+x = setdiff(names(data), y)
+aml <- h2o.automl(x = x, y = y,
+                  training_frame = data,
+                  max_runtime_secs = 60,
+                  seed = 1234)
+
+challenge_data <- as.data.frame(cbind(IgG_model_challenge %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3","age","biological_sex"),pca_result$x[(nrow(day0_training)+1):nrow(pca_result$x),1:50]))
+challenge_data <- as.h2o(challenge_data)
+
+print(aml@leader)
+challenge_predictions_12 <- h2o.predict(aml@leader, challenge_data)
+challenge_predictions_12 <- rank(as.vector(challenge_predictions_12[,1]))
+h2o.shutdown()
+```
+
+## task 2
+```{r}
+### generate training data (x,y) 
+cell_frequency_model_df <- cell_type_training %>%
+  left_join(subject_specimen_training) %>%
+  dplyr::select("Monocytes","Bcells","CD3CD19neg","CD3 Tcells","CD4Tcells","CD8Tcells","NaiveCD4","NK","Basophils","specimen_id","subject_id","planned_day_relative_to_boost","biological_sex","year_of_birth","date_of_boost","dataset") %>% 
+  mutate(age = interval(ymd(year_of_birth), ymd(date_of_boost)) / years(1)) %>%
+  dplyr::select (-date_of_boost,-year_of_birth)
+  
+day0_training <- cell_frequency_model_df %>% filter(planned_day_relative_to_boost == 0) %>% arrange(subject_id)
+day14_testing <- cell_frequency_model_df %>% filter(planned_day_relative_to_boost == 1) %>% arrange(subject_id) %>% dplyr::select("subject_id","Monocytes")
+
+### remove samples that do not have day 14 
+if(length(which(!day0_training$subject_id %in% day14_testing$subject_id)) != 0){
+  day0_training <- day0_training[-which(!day0_training$subject_id %in% day14_testing$subject_id),]
+}
+day14_testing$Monocytes_FC <- day14_testing$Monocytes/day0_training$Monocytes
+
+### add other features
+# antibody <- plasma_ab_titer_training %>% inner_join(day0_training, by = "specimen_id") %>% arrange(specimen_id)
+# gene_expression <- gene_expression_training %>% inner_join(day0_training, by = "specimen_id") %>% arrange(specimen_id)
+# plasma_cytokine <- plasma_cytokine_training %>% inner_join(day0_training, by = "specimen_id") %>% arrange(specimen_id) 
+
+#t_cell_polarization <- t_cell_polarization_training  %>% inner_join(day0_training, by = "specimen_id") %>% arrange(specimen_id) 
+#t_cell_activation <- t_cell_activation_training %>% inner_join(day0_training, by = "specimen_id") %>% arrange(specimen_id) 
+antibody <- plasma_ab_titer_training
+gene_expression <- gene_expression_training
+plasma_cytokine <- plasma_cytokine_training
+common_specimen_ids <- Reduce(intersect, list(antibody$specimen_id, gene_expression$specimen_id, plasma_cytokine$specimen_id,day0_training$specimen_id))
+
+antibody <- antibody[antibody$specimen_id %in% common_specimen_ids, ] %>% arrange(specimen_id)
+gene_expression <- gene_expression[gene_expression$specimen_id %in% common_specimen_ids, ] %>% arrange(specimen_id)
+plasma_cytokine <- plasma_cytokine[plasma_cytokine$specimen_id %in% common_specimen_ids, ] %>% arrange(specimen_id)
+
+idx <- which(day0_training$specimen_id %in% common_specimen_ids)
+day0_training <- day0_training[idx,]
+day14_testing <- day14_testing[idx,]
+
+### add the challenge data
+gene_expression <- rbind(gene_expression,gene_expression_challenge)
+plasma_cytokine <- rbind(plasma_cytokine,plasma_cytokine_challenge)
+### change gene expression to symbol name and select top 2000 hvf genes
+
+expr_matrix <- gene_expression[,-1]
+expr_matrix <- apply(expr_matrix, 2, as.numeric)
+expr_matrix <- t(expr_matrix)
+
+expr_matrix <- expr_matrix[rowSums(expr_matrix) > 0, ]
+expr_matrix <- expr_matrix[!apply(expr_matrix, 1, function(row) all(is.na(row))), ]
+
+seurat_object <- CreateSeuratObject(counts = expr_matrix)
+seurat_object <- FindVariableFeatures(seurat_object, selection.method = "vst", nfeatures = 2000)
+top_variable_genes <- VariableFeatures(seurat_object)
+
+gene_expression_top <- gene_expression[,which(colnames(gene_expression) %in% top_variable_genes)]
+
+mart <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+ensembl_ids <- gsub("\\..*", "", colnames(gene_expression_top))
+gene_info <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+filters = "ensembl_gene_id",
+  values = ensembl_ids,
+  mart = mart
+)
+gene_info <- gene_info[!gene_info$hgnc_symbol=="", ]
+idx <- which(ensembl_ids %in% gene_info$ensembl_gene_id)
+gene_expression_top <- gene_expression_top[,idx]
+colnames(gene_expression_top) <- gene_info$hgnc_symbol
+
+pca_result_gene <- prcomp(gene_expression_top, center = TRUE, scale. = TRUE)
+pca_result_cytokine <- apply(plasma_cytokine[,2:30], 2, as.numeric)
+pca_result_cytokine <- pca_result_cytokine[, !apply(pca_result_cytokine, 2, function(col) any(is.na(col) | is.nan(col)))]
+pca_result_cytokine <- prcomp(pca_result_cytokine, center = TRUE, scale. = TRUE)
+colnames(pca_result_cytokine$x)[1:3] <- c("cytokine_1","cytokine_2","cytokine_3")
+colnames(day14_testing)[2] <- "Monocytes_D1"
+
+### Train model for task 2.1
+model_data <- as.data.frame(cbind(day14_testing[,"Monocytes_D1"],day0_training %>% dplyr::select("Monocytes","Bcells","CD3CD19neg","CD3 Tcells","CD4Tcells","CD8Tcells","NaiveCD4","NK","Basophils","age","biological_sex"),pca_result_gene$x[,1:50],pca_result_cytokine$x[,1:3],antibody %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3")))
+
+model_data$biological_sex <- as.factor(model_data$biological_sex)
+model_data$Monocytes_D1 <- round(model_data$Monocytes_D1)
+
+spearman_correlation_task21 <- c()
+model_list_21 <- c()
+h2o.init()
+
+for (i in 1:30){
+  # set.seed(i)
+  # train_indices <- sample(seq_len(nrow(model_data)), size = 0.7 * nrow(model_data))
+  # train_data <- model_data[train_indices, ]
+  # test_data <- model_data[-train_indices, ]
+  # 
+  # model <- glm(Monocytes_D1 ~ ., 
+  #             family = poisson(link = "log"), 
+  #             data = train_data)
+  # predictions <- predict(model, test_data, type = "response")
+  
+  data <- as.h2o(model_data)
+  splits <- h2o.splitFrame(data, ratios = 0.7, seed = i)
+  train_data <- splits[[1]]
+  test_data <- splits[[2]]
+  y = "Monocytes_D1"
+  x = setdiff(names(train_data), y)
+  aml <- h2o.automl(x = x, y = y,
+                  training_frame = train_data,
+                  max_runtime_secs = 60,
+                  seed = i)
+  lb <- aml@leaderboard
+  predictions <- h2o.predict(aml@leader, test_data)
+  model_list_21 <- c(model_list_21,aml@leader@model_id)
+  spearman_estimate <- cor.test(as.vector(predictions[,1]),as.vector(test_data[,"Monocytes_D1"]),method = "spearman",exact = FALSE)$estimate
+  
+  #spearman_estimate <- cor.test(predictions,test_data$Monocytes_D1,method = "spearman",exact = FALSE)$estimate
+  spearman_correlation_task21 <- c(spearman_correlation_task21,spearman_estimate)
+}
+spearman_correlation_task21 <- sort(spearman_correlation_task21, decreasing = TRUE)[1:10]
+h2o.shutdown()
+
+### make predictions for the challenge dataset
+h2o.init()
+model_data <- as.data.frame(cbind(day14_testing[,"Monocytes_D1"],day0_training %>% dplyr::select("Monocytes","Bcells","CD3CD19neg","CD3 Tcells","CD4Tcells","CD8Tcells","NaiveCD4","NK","Basophils","age","biological_sex"),pca_result_gene$x[1:nrow(day0_training),1:50],pca_result_cytokine$x[1:nrow(day0_training),1:3],antibody %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3")))
+
+model_data$biological_sex <- as.factor(model_data$biological_sex)
+model_data$Monocytes_D1 <- round(model_data$Monocytes_D1)
+
+data <- as.h2o(model_data)
+y = "Monocytes_D1"
+x = setdiff(names(data), y)
+aml <- h2o.automl(x = x, y = y,
+                  training_frame = data,
+                  max_runtime_secs = 60,
+                  seed = 1234)
+
+challenge_data <- as.data.frame(cbind(cell_type_challenge %>% dplyr::select("Monocytes","Bcells","CD3CD19neg","CD3 Tcells","CD4Tcells","CD8Tcells","NaiveCD4","NK","Basophils"),pca_result_gene$x[(nrow(day0_training)+1):nrow(pca_result_gene$x),1:50],pca_result_cytokine$x[(nrow(day0_training)+1):nrow(pca_result_cytokine$x),1:3],IgG_model_challenge %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3","age","biological_sex")))
+challenge_data <- as.h2o(challenge_data)
+
+print(aml@leader)
+challenge_predictions_21 <- h2o.predict(aml@leader, challenge_data)
+challenge_predictions_21 <- rank(as.vector(challenge_predictions_21[,1]))
+h2o.shutdown()
+
+
+### Train model for task 2.2 
+
+model_data <- as.data.frame(cbind(day14_testing[,"Monocytes_FC"],day0_training %>% dplyr::select("Monocytes","Bcells","CD3CD19neg","CD3 Tcells","CD4Tcells","CD8Tcells","NaiveCD4","NK","Basophils","age","biological_sex"),pca_result_gene$x[,1:3],pca_result_cytokine$x[,1:3],antibody %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3")))
+
+model_data$biological_sex <- as.factor(model_data$biological_sex)
+#model_data$Monocytes_FC <- round(model_data$Monocytes_FC)
+#model_data$Monocytes_FC <- 1 / (1 + exp(-model_data$Monocytes_FC))
+
+spearman_correlation_task22 <- c()
+model_list_22 <- c()
+h2o.init()
+
+for (i in 1:30){
+  # set.seed(i)
+  # train_indices <- sample(seq_len(nrow(model_data)), size = 0.7 * nrow(model_data))
+  # train_data <- model_data[train_indices, ]
+  # test_data <- model_data[-train_indices, ]
+  # 
+  # model <- glm(Monocytes_FC ~ ., 
+  #             family = Gamma, 
+  #             data = train_data)
+  # predictions <- predict(model, test_data, type = "response")
+  
+  data <- as.h2o(model_data)
+  splits <- h2o.splitFrame(data, ratios = 0.7, seed = i)
+  train_data <- splits[[1]]
+  test_data <- splits[[2]]
+  y = "Monocytes_FC"
+  x = setdiff(names(train_data), y)
+  aml <- h2o.automl(x = x, y = y,
+                  training_frame = train_data,
+                  max_runtime_secs = 60,
+                  seed = i)
+  lb <- aml@leaderboard
+  predictions <- h2o.predict(aml@leader, test_data)
+  model_list_22 <- c(model_list_22,aml@leader@model_id)
+  spearman_estimate <- cor.test(as.vector(predictions[,1]),as.vector(test_data[,"Monocytes_FC"]),method = "spearman",exact = FALSE)$estimate
+  
+  # spearman_estimate <- cor.test(predictions,test_data$Monocytes_FC,method = "spearman",exact = FALSE)$estimate
+  spearman_correlation_task22 <- c(spearman_correlation_task22,spearman_estimate)
+}
+spearman_correlation_task22 <- sort(spearman_correlation_task22, decreasing = TRUE)[1:10]
+h2o.shutdown()
+
+### prediction for the challenge dataset
+h2o.init()
+model_data <- as.data.frame(cbind(day14_testing[,"Monocytes_FC"],day0_training %>% dplyr::select("Monocytes","Bcells","CD3CD19neg","CD3 Tcells","CD4Tcells","CD8Tcells","NaiveCD4","NK","Basophils","age","biological_sex"),pca_result_gene$x[1:nrow(day0_training),1:50],pca_result_cytokine$x[1:nrow(day0_training),1:3],antibody %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3")))
+model_data$biological_sex <- as.factor(model_data$biological_sex)
+
+data <- as.h2o(model_data)
+y = "Monocytes_FC"
+x = setdiff(names(data), y)
+aml <- h2o.automl(x = x, y = y,
+                  training_frame = data,
+                  max_runtime_secs = 60,
+                  seed = 1234)
+
+challenge_data <- as.data.frame(cbind(cell_type_challenge %>% dplyr::select("Monocytes","Bcells","CD3CD19neg","CD3 Tcells","CD4Tcells","CD8Tcells","NaiveCD4","NK","Basophils"),pca_result_gene$x[(nrow(day0_training)+1):nrow(pca_result_gene$x),1:50],pca_result_cytokine$x[(nrow(day0_training)+1):nrow(pca_result_cytokine$x),1:3],IgG_model_challenge %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3","age","biological_sex")))
+challenge_data <- as.h2o(challenge_data)
+
+print(aml@leader)
+challenge_predictions_22 <- h2o.predict(aml@leader, challenge_data)
+challenge_predictions_22 <- rank(as.vector(challenge_predictions_22[,1]))
+h2o.shutdown()
+```
+
+## task 3
+```{r}
+### generate training data (x,y) 
+matching_indices <- grep("ENSG00000277632", colnames(gene_expression_training))
+
+gene_expression_model_df <- gene_expression_training %>%
+  left_join(subject_specimen_training) %>%
+  dplyr::select("ENSG00000277632.1","specimen_id","subject_id","planned_day_relative_to_boost","biological_sex","year_of_birth","date_of_boost","dataset") %>% 
+  mutate(age = interval(ymd(year_of_birth), ymd(date_of_boost)) / years(1)) %>%
+  dplyr::select (-date_of_boost,-year_of_birth)
+  
+day0_training <- gene_expression_model_df %>% filter(planned_day_relative_to_boost == 0) %>% arrange(subject_id)
+day14_testing <- gene_expression_model_df %>% filter(planned_day_relative_to_boost == 3) %>% arrange(subject_id) %>% dplyr::select("subject_id","ENSG00000277632.1")
+
+### remove samples that do not have day 14 
+if(length(which(!day0_training$subject_id %in% day14_testing$subject_id)) != 0){
+  day0_training <- day0_training[-which(!day0_training$subject_id %in% day14_testing$subject_id),]
+}
+day14_testing$CCL3_FC <- day14_testing$ENSG00000277632.1/day0_training$ENSG00000277632.1
+
+### add other features
+# antibody <- plasma_ab_titer_training %>% inner_join(day0_training, by = "specimen_id") %>% arrange(specimen_id)
+# gene_expression <- gene_expression_training %>% inner_join(day0_training, by = "specimen_id") %>% arrange(specimen_id)
+# plasma_cytokine <- plasma_cytokine_training %>% inner_join(day0_training, by = "specimen_id") %>% arrange(specimen_id) 
+
+#t_cell_polarization <- t_cell_polarization_training  %>% inner_join(day0_training, by = "specimen_id") %>% arrange(specimen_id) 
+#t_cell_activation <- t_cell_activation_training %>% inner_join(day0_training, by = "specimen_id") %>% arrange(specimen_id) 
+antibody <- plasma_ab_titer_training
+gene_expression <- gene_expression_training
+#plasma_cytokine <- plasma_cytokine_training
+common_specimen_ids <- Reduce(intersect, list(antibody$specimen_id, gene_expression$specimen_id, day0_training$specimen_id))
+
+antibody <- antibody[antibody$specimen_id %in% common_specimen_ids, ] %>% arrange(specimen_id)
+gene_expression <- gene_expression[gene_expression$specimen_id %in% common_specimen_ids, ] %>% arrange(specimen_id)
+
+idx <- which(day0_training$specimen_id %in% common_specimen_ids)
+day0_training <- day0_training[idx,]
+day14_testing <- day14_testing[idx,]
+
+### add the challenge data
+gene_expression <- rbind(gene_expression,gene_expression_challenge)
+
+### change gene expression to symbol name and select top 2000 hvf genes
+
+expr_matrix <- gene_expression[,-1]
+expr_matrix <- expr_matrix[,-which(colnames(expr_matrix) == "ENSG00000277632.1")]
+expr_matrix <- apply(expr_matrix, 2, as.numeric)
+expr_matrix <- t(expr_matrix)
+
+expr_matrix <- expr_matrix[rowSums(expr_matrix) > 0, ]
+expr_matrix <- expr_matrix[!apply(expr_matrix, 1, function(row) all(is.na(row))), ]
+
+seurat_object <- CreateSeuratObject(counts = expr_matrix)
+seurat_object <- FindVariableFeatures(seurat_object, selection.method = "vst", nfeatures = 2000)
+top_variable_genes <- VariableFeatures(seurat_object)
+
+gene_expression_top <- gene_expression[,which(colnames(gene_expression) %in% top_variable_genes)]
+
+mart <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+ensembl_ids <- gsub("\\..*", "", colnames(gene_expression_top))
+gene_info <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+filters = "ensembl_gene_id",
+  values = ensembl_ids,
+  mart = mart
+)
+gene_info <- gene_info[!gene_info$hgnc_symbol=="", ]
+idx <- which(ensembl_ids %in% gene_info$ensembl_gene_id)
+gene_expression_top <- gene_expression_top[,idx]
+colnames(gene_expression_top) <- gene_info$hgnc_symbol
+
+pca_result_gene <- prcomp(gene_expression_top, center = TRUE, scale. = TRUE)
+
+### Train model for task 3.1
+colnames(day14_testing)[2] <- "CCL3"
+model_data <- as.data.frame(cbind(day14_testing[,"CCL3"],day0_training %>% dplyr::select("ENSG00000277632.1","age","biological_sex"),pca_result_gene$x[,1:50],antibody %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3")))
+
+model_data$biological_sex <- as.factor(model_data$biological_sex)
+model_data$CCL3 <- round(model_data$CCL3)
+
+spearman_correlation_task31 <- c()
+model_list_31 <- c()
+h2o.init()
+
+for (i in 1:30){
+  # set.seed(i)
+  # train_indices <- sample(seq_len(nrow(model_data)), size = 0.7 * nrow(model_data))
+  # train_data <- model_data[train_indices, ]
+  # test_data <- model_data[-train_indices, ]
+  # 
+  # model <- glm(CCL3 ~ ., 
+  #             family = poisson(link = "log"), 
+  #             data = train_data)
+  # predictions <- predict(model, test_data, type = "response")
+  
+  data <- as.h2o(model_data)
+  splits <- h2o.splitFrame(data, ratios = 0.7, seed = i)
+  train_data <- splits[[1]]
+  test_data <- splits[[2]]
+  y = "CCL3"
+  x = setdiff(names(train_data), y)
+  aml <- h2o.automl(x = x, y = y,
+                  training_frame = train_data,
+                  max_runtime_secs = 60,
+                  seed = i)
+  lb <- aml@leaderboard
+  predictions <- h2o.predict(aml@leader, test_data)
+  model_list_31 <- c(model_list_31,aml@leader@model_id)
+  spearman_estimate <- cor.test(as.vector(predictions[,1]),as.vector(test_data[,"CCL3"]),method = "spearman",exact = FALSE)$estimate
+  
+  #spearman_estimate <- cor.test(predictions,test_data$CCL3,method = "spearman",exact = FALSE)$estimate
+  spearman_correlation_task31 <- c(spearman_correlation_task31,spearman_estimate)
+}
+spearman_correlation_task31 <- sort(spearman_correlation_task31, decreasing = TRUE)[1:10]
+h2o.shutdown()
+
+### prediction for the challenge dataset
+colnames(day14_testing)[2] <- "CCL3"
+h2o.init()
+model_data <- as.data.frame(cbind(day14_testing[,"CCL3"],day0_training %>% dplyr::select("ENSG00000277632.1","age","biological_sex"),pca_result$x[1:nrow(day0_training),1:50],antibody %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3")))
+
+model_data$biological_sex <- as.factor(model_data$biological_sex)
+model_data$CCL3 <- round(model_data$CCL3)
+
+data <- as.h2o(model_data)
+y = "CCL3"
+x = setdiff(names(data), y)
+aml <- h2o.automl(x = x, y = y,
+                  training_frame = data,
+                  max_runtime_secs = 60,
+                  seed = 1234)
+
+challenge_data <- as.data.frame(cbind(gene_expression_challenge %>% dplyr::select("ENSG00000277632.1"),pca_result$x[(nrow(pca_result$x)-nrow(gene_expression_challenge)+1):nrow(pca_result$x),1:50],IgG_model_challenge %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3","age","biological_sex")))
+challenge_data <- as.h2o(challenge_data)
+
+print(aml@leader)
+challenge_predictions_31 <- h2o.predict(aml@leader, challenge_data)
+challenge_predictions_31 <- rank(as.vector(challenge_predictions_31[,1]))
+h2o.shutdown()
+
+### Train model for task 3.2 
+
+model_data <- as.data.frame(cbind(day14_testing[,"CCL3_FC"],day0_training %>% dplyr::select("ENSG00000277632.1","age","biological_sex"),pca_result_gene$x[,1:50],antibody %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3")))
+
+model_data$biological_sex <- as.factor(model_data$biological_sex)
+#model_data$CCL3_FC <- round(model_data$CCL3_FC)
+#model_data$CCL3_FC <- 1 / (1 + exp(-model_data$CCL3_FC))
+
+spearman_correlation_task32 <- c()
+model_list_32 <- c()
+h2o.init()
+for (i in 1:30){
+  # set.seed(i)
+  # train_indices <- sample(seq_len(nrow(model_data)), size = 0.7 * nrow(model_data))
+  # train_data <- model_data[train_indices, ]
+  # test_data <- model_data[-train_indices, ]
+  # 
+  # model <- glm(CCL3_FC ~ ., 
+  #             family = quasibinomial(link = "logit"), 
+  #             data = train_data)
+  # predictions <- predict(model, test_data, type = "response")
+  
+  data <- as.h2o(model_data)
+  splits <- h2o.splitFrame(data, ratios = 0.7, seed = i)
+  train_data <- splits[[1]]
+  test_data <- splits[[2]]
+  y = "CCL3_FC"
+  x = setdiff(names(train_data), y)
+  aml <- h2o.automl(x = x, y = y,
+                  training_frame = train_data,
+                  max_runtime_secs = 60,
+                  seed = i)
+  lb <- aml@leaderboard
+  predictions <- h2o.predict(aml@leader, test_data)
+  model_list_32 <- c(model_list_32,aml@leader@model_id)
+  spearman_estimate <- cor.test(as.vector(predictions[,1]),as.vector(test_data[,"CCL3_FC"]),method = "spearman",exact = FALSE)$estimate
+  
+  #spearman_estimate <- cor.test(predictions,test_data$CCL3_FC,method = "spearman",exact = FALSE)$estimate
+  spearman_correlation_task32 <- c(spearman_correlation_task32,spearman_estimate)
+}
+spearman_correlation_task32 <- sort(spearman_correlation_task32, decreasing = TRUE)[1:10]
+h2o.shutdown()
+
+### prediction for the challenge dataset
+h2o.init()
+
+model_data <- as.data.frame(cbind(day14_testing[,"CCL3_FC"],day0_training %>% dplyr::select("ENSG00000277632.1","age","biological_sex"),pca_result$x[1:nrow(day0_training),1:50],antibody %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3")))
+
+model_data$biological_sex <- as.factor(model_data$biological_sex)
+
+data <- as.h2o(model_data)
+y = "CCL3_FC"
+x = setdiff(names(data), y)
+aml <- h2o.automl(x = x, y = y,
+                  training_frame = data,
+                  max_runtime_secs = 60,
+                  seed = 1234)
+
+challenge_data <- as.data.frame(cbind(gene_expression_challenge %>% dplyr::select("ENSG00000277632.1"),pca_result$x[(nrow(pca_result$x)-nrow(gene_expression_challenge)+1):nrow(pca_result$x),1:50],IgG_model_challenge %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3","age","biological_sex")))
+challenge_data <- as.h2o(challenge_data)
+
+print(aml@leader)
+challenge_predictions_32 <- h2o.predict(aml@leader, challenge_data)
+challenge_predictions_32 <- rank(as.vector(challenge_predictions_32[,1]))
+h2o.shutdown()
+```
+
+
+### bonus task
+```{r}
+tcell_polar_model_df <- t_cell_polarization_training %>%
+  left_join(subject_specimen_training) %>%
+  dplyr::select("PT_P05113","PT_P01579","specimen_id","subject_id","planned_day_relative_to_boost","biological_sex","year_of_birth","date_of_boost","dataset") %>% 
+  mutate(age = interval(ymd(year_of_birth), ymd(date_of_boost)) / years(1)) %>%
+  dplyr::select (-date_of_boost,-year_of_birth)
+  
+day0_training <- tcell_polar_model_df %>% filter(planned_day_relative_to_boost == 0) %>% arrange(subject_id)
+day14_testing <- tcell_polar_model_df %>% filter(planned_day_relative_to_boost == 30) %>% arrange(subject_id) %>% dplyr::select("subject_id","PT_P05113","PT_P01579")
+
+### remove samples that do not have day 14 
+if(length(which(!day0_training$subject_id %in% day14_testing$subject_id)) != 0){
+  day0_training <- day0_training[-which(!day0_training$subject_id %in% day14_testing$subject_id),]
+}
+day14_testing$ratio <- day14_testing$PT_P05113/day14_testing$PT_P01579
+
+### add other features
+# antibody <- plasma_ab_titer_training %>% inner_join(day0_training, by = "specimen_id") %>% arrange(specimen_id)
+# gene_expression <- gene_expression_training %>% inner_join(day0_training, by = "specimen_id") %>% arrange(specimen_id)
+# plasma_cytokine <- plasma_cytokine_training %>% inner_join(day0_training, by = "specimen_id") %>% arrange(specimen_id) 
+
+#t_cell_polarization <- t_cell_polarization_training  %>% inner_join(day0_training, by = "specimen_id") %>% arrange(specimen_id) 
+#t_cell_activation <- t_cell_activation_training %>% inner_join(day0_training, by = "specimen_id") %>% arrange(specimen_id) 
+antibody <- plasma_ab_titer_training
+gene_expression <- gene_expression_training
+plasma_cytokine <- plasma_cytokine_training
+common_specimen_ids <- Reduce(intersect, list(antibody$specimen_id, gene_expression$specimen_id,plasma_cytokine$specimen_id, day0_training$specimen_id))
+
+antibody <- antibody[antibody$specimen_id %in% common_specimen_ids, ] %>% arrange(specimen_id)
+gene_expression <- gene_expression[gene_expression$specimen_id %in% common_specimen_ids, ] %>% arrange(specimen_id)
+plasma_cytokine <- plasma_cytokine[plasma_cytokine$specimen_id %in% common_specimen_ids, ] %>% arrange(specimen_id)
+
+idx <- which(day0_training$specimen_id %in% common_specimen_ids)
+day0_training <- day0_training[idx,]
+day14_testing <- day14_testing[idx,]
+
+### for challgenge prediction 
+gene_expression <- rbind(gene_expression,gene_expression_challenge)
+plasma_cytokine <- rbind(plasma_cytokine,plasma_cytokine_challenge)
+
+### change gene expression to symbol name and select top 2000 hvf genes
+
+expr_matrix <- gene_expression[,-1]
+expr_matrix <- apply(expr_matrix, 2, as.numeric)
+expr_matrix <- t(expr_matrix)
+
+expr_matrix <- expr_matrix[rowSums(expr_matrix) > 0, ]
+expr_matrix <- expr_matrix[!apply(expr_matrix, 1, function(row) all(is.na(row))), ]
+
+seurat_object <- CreateSeuratObject(counts = expr_matrix)
+seurat_object <- FindVariableFeatures(seurat_object, selection.method = "vst", nfeatures = 2000)
+top_variable_genes <- VariableFeatures(seurat_object)
+
+gene_expression_top <- gene_expression[,which(colnames(gene_expression) %in% top_variable_genes)]
+
+mart <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+ensembl_ids <- gsub("\\..*", "", colnames(gene_expression_top))
+gene_info <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+filters = "ensembl_gene_id",
+  values = ensembl_ids,
+  mart = mart
+)
+gene_info <- gene_info[!gene_info$hgnc_symbol=="", ]
+idx <- which(ensembl_ids %in% gene_info$ensembl_gene_id)
+gene_expression_top <- gene_expression_top[,idx]
+colnames(gene_expression_top) <- gene_info$hgnc_symbol
+
+pca_result_gene <- prcomp(gene_expression_top, center = TRUE, scale. = TRUE)
+pca_result_cytokine <- apply(plasma_cytokine[,2:30], 2, as.numeric)
+pca_result_cytokine <- pca_result_cytokine[, !apply(pca_result_cytokine, 2, function(col) any(is.na(col) | is.nan(col)))]
+pca_result_cytokine <- prcomp(pca_result_cytokine, center = TRUE, scale. = TRUE)
+colnames(pca_result_cytokine$x)[1:3] <- c("cytokine_1","cytokine_2","cytokine_3")
+
+### Train model for task 4.1
+model_data <- as.data.frame(cbind(day14_testing[,"ratio"],day0_training %>% dplyr::select("PT_P05113",                     "PT_P01579","age","biological_sex"),pca_result_gene$x[,1:20],pca_result_cytokine$x[,1:3],antibody %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3")))
+
+model_data$biological_sex <- as.factor(model_data$biological_sex)
+#model_data$ratio <- round(model_data$ratio)
+#model_data$ratio <- 1 / (1 + exp(-model_data$ratio))
+
+spearman_correlation_task41 <- c()
+model_list_41 <- c()
+h2o.init()
+
+for (i in 1:30){
+  # set.seed(i)
+  # train_indices <- sample(seq_len(nrow(model_data)), size = 0.7 * nrow(model_data))
+  # train_data <- model_data[train_indices, ]
+  # test_data <- model_data[-train_indices, ]
+  # 
+  # model <- glm(ratio ~ ., 
+  #             family = quasibinomial(link = "logit"), 
+  #             data = train_data)
+  # predictions <- predict(model, test_data, type = "response")
+  
+  data <- as.h2o(model_data)
+  splits <- h2o.splitFrame(data, ratios = 0.7, seed = i)
+  train_data <- splits[[1]]
+  test_data <- splits[[2]]
+  y = "ratio"
+  x = setdiff(names(train_data), y)
+  aml <- h2o.automl(x = x, y = y,
+                  training_frame = train_data,
+                  max_runtime_secs = 60,
+                  seed = i)
+  lb <- aml@leaderboard
+  predictions <- h2o.predict(aml@leader, test_data)
+  model_list_41 <- c(model_list_41,aml@leader@model_id)
+  spearman_estimate <- cor.test(as.vector(predictions[,1]),as.vector(test_data[,"ratio"]),method = "spearman",exact = FALSE)$estimate
+  
+  #spearman_estimate <- cor.test(predictions,test_data$ratio,method = "spearman",exact = FALSE)$estimate
+  spearman_correlation_task41 <- c(spearman_correlation_task41,spearman_estimate)
+}
+spearman_correlation_task41 <- sort(spearman_correlation_task41, decreasing = TRUE)[1:10]
+h2o.shutdown()
+
+### prediction for the challenge dataset
+h2o.init()
+
+model_data <- as.data.frame(cbind(day14_testing[,"ratio"],day0_training %>% dplyr::select("PT_P05113",                     "PT_P01579","age","biological_sex"),pca_result_gene$x[1:nrow(day0_training),1:20],pca_result_cytokine$x[1:nrow(day0_training),1:3],antibody %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3")))
+model_data$biological_sex <- as.factor(model_data$biological_sex)
+
+data <- as.h2o(model_data)
+y = "ratio"
+x = setdiff(names(data), y)
+aml <- h2o.automl(x = x, y = y,
+                  training_frame = data,
+                  max_runtime_secs = 60,
+                  seed = 123)
+
+challenge_data <- as.data.frame(cbind(t_cell_polarization_challenge %>% dplyr::select("PT_P05113","PT_P01579"),pca_result_gene$x[(nrow(day0_training)+1):nrow(pca_result_gene$x),1:20],pca_result_cytokine$x[(nrow(day0_training)+1):nrow(pca_result_cytokine$x),1:3],IgG_model_challenge %>% dplyr::select("IgG1_PT","IgG1_PRN","IgG1_FHA","IgG1_FIM2/3","age","biological_sex")))
+challenge_data <- as.h2o(challenge_data)
+
+print(aml@leader)
+challenge_predictions_41 <- h2o.predict(aml@leader, challenge_data)
+challenge_predictions_41 <- rank(as.vector(challenge_predictions_41[,1]))
+h2o.shutdown()
+
+```
+
+### visualize data
+
+```{r}
+cor_data <- data.frame(spearman_correlation_task11,spearman_correlation_task12,spearman_correlation_task21,
+                       spearman_correlation_task22,spearman_correlation_task31,spearman_correlation_task32,
+                       spearman_correlation_task41)
+colnames(cor_data) <- c("IgG_PT_Day14","IgG_PT_FC","Monocytes_Day1","Monocytes_FC","CCL3_Day3","CCL3_FC","IFN / IL-5")
+means <- colMeans(cor_data)
+sds <- apply(cor_data, 2, sd)  # Standard deviation
+ses <- sds / sqrt(nrow(cor_data))
+plot_data <- data.frame(
+  Category = colnames(cor_data),
+  Mean = means,
+  SD = sds,  # Use `SD = ses` for standard error
+  SE = ses   # Standard error if needed
+)
+library(ggplot2)
+
+# Create the bar plot with error bars
+ggplot(plot_data, aes(x = Category, y = Mean)) +
+  geom_bar(stat = "identity", fill = "#ffd47f", color = "black", width = 0.6) +  # Bar plot
+  geom_errorbar(aes(ymin = Mean - SD, ymax = Mean + SD), width = 0.2, color = "black") +  # Error bars
+  labs(x = "", y = "Spearman Correlation", title = "") +
+  theme_bw() + theme(axis.text.x = element_text(angle = 60, vjust = 1, hjust = 1),
+                     panel.grid.major = element_blank(),  # Remove major grid lines
+                     panel.grid.minor = element_blank())+ylim(0,1)
+ggsave("~/Desktop/CMI-PB/train.png",width=7,height=4)
+```
+
+### output prediction task
+
+```{r}
+model_name <- c("GBM_lr_annealing_selection_AutoML_11_20241112_03807_select_model","DeepLearning_grid_2_AutoML_12_20241112_03942_model_1", "GBM_lr_annealing_selection_AutoML_8_20241112_02329_select_model","StackedEnsemble_AllModels_6_AutoML_10_20241112_02726 ","GBM_grid_1_AutoML_5_20241112_01020_model_108","GBM_lr_annealing_selection_AutoML_6_20241112_01209_select_model","DeepLearning_grid_3_AutoML_7_20241112_01950_model_1")
+
+
+h2o_model_df <- data.frame(challenge_predictions_11,challenge_predictions_12,challenge_predictions_21,
+                       challenge_predictions_22,challenge_predictions_31,challenge_predictions_32,
+                       challenge_predictions_41)
+h2o_model_df$SubjectID <- IgG_model_challenge$subject_id
+  
+submission_template = readr::read_tsv("3rdChallengeSubmissionTemplate.tsv")
+kept_columns <- submission_template %>%
+  dplyr::select(SubjectID, Age, BiologicalSexAtBirth, VaccinePrimingStatus)
+# Getting the names of columns to be replaced with age_rank
+submission_template_col_names <- names(submission_template)
+
+h2o_model_sbumission_df <- kept_columns %>%
+  left_join(h2o_model_df, by = "SubjectID") 
+
+
+# Combining the kept columns with the new age_rank columns
+colnames(h2o_model_sbumission_df) <- submission_template_col_names
+write.table(h2o_model_sbumission_df, file = "Predictions_final_v3.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+### check model correlation with harry
+
+```{r}
+harry_result <- read.csv("~/Desktop/CMI-PB/final_prediction_rank.csv")
+harry_result <- harry_result %>% 
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+
+Junxi_result <- read.csv("~/Desktop/CMI-PB/final_result_JF.csv")
+Junxi_result <- Junxi_result %>% 
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+
+Junxi_result <- Junxi_result[order(Junxi_result$subject_id), ]
+h2o_model_sbumission_df <- readr::read_tsv("~/Desktop/CMI-PB/Predictions_final.tsv")
+
+h2o_model <- h2o_model_sbumission_df[,5:10]
+h2o_model <- h2o_model[,c(5,6,1,2,3,4)]
+Junxi_result <- Junxi_result[,-1]
+harry_result <- harry_result[,-1]
+
+cor1 <- c()
+cor2 <- c()
+cor3 <- c()
+for (i in 1:6){
+  vector_h2o <- as.vector(h2o_model[,i])[[1]]
+  cor1 <- c(cor1,cor.test(harry_result[,i],Junxi_result[,i],method="spearman",exact=FALSE)$estimate)
+  cor2 <- c(cor2,cor.test(vector_h2o,Junxi_result[,i],method="spearman",exact=FALSE)$estimate)
+  cor3 <- c(cor3,cor.test(vector_h2o,harry_result[,i],method="spearman",exact=FALSE)$estimate)
+}
+
+
+df <- data.frame(
+  Row = rep(colnames(harry_result), times = 3),
+  Correlation = c(cor1, cor2, cor3),
+  Group = rep(c("HXZ vs JXF", "HXF vs JXF", "HXZ vs HXF"), each = 6)
+)
+
+ggplot(df, aes(x = factor(Row), y = Correlation, fill = Group)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "", y = "Spearman Correlation") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+
+### check with baseline igg 
+cor1 <- cor.test(IgG_model_submission_df$`1.1) IgG-PT-D14-titer-Rank`,harry_result$igg,method="spearman",exact=FALSE)$estimate
+cor2 <- cor.test(IgG_model_submission_df$`1.1) IgG-PT-D14-titer-Rank`,Junxi_result$igg,method="spearman",exact=FALSE)$estimate
+cor3 <- cor.test(IgG_model_submission_df$`1.1) IgG-PT-D14-titer-Rank`,h2o_model$`1.1) IgG-PT-D14-titer-Rank`,method="spearman",exact=FALSE)$estimate
+
+df <- data.frame(
+  Category = c("Harry","Junxi","Hongxiang"),
+  Value = c(cor1,cor2,cor3)
+)
+
+# Create a bar plot
+ggplot(df, aes(x = Category, y = Value)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(title = "Correlation with baseline IgG model for task 1.1", y = "spearman correlation", x = "") +
+  theme_minimal()+ylim(-1,1)
+```
+
+check between my submission
+
+```{r}
+h2o_model_sbumission_df <- readr::read_tsv("~/Desktop/CMI-PB/Predictions_final.tsv")
+h2o_model_sbumission_df_v2 <- readr::read_tsv("~/Desktop/CMI-PB/Predictions_final_v2.tsv")
+
+h2o_model_sbumission_df_rev <- h2o_model_sbumission_df
+h2o_model_sbumission_df_rev[, 5:11] <- lapply(h2o_model_sbumission_df_rev[, 5:11], function(x) rank(-x, ties.method = "first"))
+write.table(h2o_model_sbumission_df_rev, file = "Predictions_final_v4.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+
+cor.test(h2o_model_sbumission_df$`4.1) IFNG/IL5-Polarization-D30-Rank`,h2o_model_sbumission_df_v2$`4.1) IFNG/IL5-Polarization-D30-Rank`,exact=FALSE)
+```
+
+
